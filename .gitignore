@@ -1,0 +1,35 @@
+# Build artifacts
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+TestResults/
+BenchmarkDotNet.Artifacts/
+
+# IDE and editor folders
+.vs/
+.vscode/
+.idea/
+
+# User-specific files
+*.user
+*.rsuser
+*.suo
+*.userosscache
+*.sln.docstates
+
+# NuGet and packages
+packages/
+*.nupkg
+*.snupkg
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
