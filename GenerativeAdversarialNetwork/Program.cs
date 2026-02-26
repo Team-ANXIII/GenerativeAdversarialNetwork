@@ -1,28 +1,32 @@
-﻿using System;
+using System;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Globalization;
 using System.Collections.Generic;
 using back_propagation;
 
+const int ImageVectorSize = 28 * 28;
+const int ConditionVectorSize = 10;
+const int HiddenSize = 128;
+
+const decimal UpdateActivationClip = 10m;
+const decimal UpdateDeltaClip = 10m;
+const decimal UpdateGradientClip = 25m;
+const decimal WeightClip = 5m;
 
 Main();
 static void Main()
 {
-    Console.WriteLine("Enter command ('train', 'dtest', or 'gtest'):");
+    Console.WriteLine("Enter command ('train' or 'test'):");
     var cmd = Console.ReadLine()?.Trim().ToLowerInvariant();
     if (cmd == "train")
     {
         Train();
     }
-    else if (cmd == "dtest" || cmd == "test")
+    else if (cmd == "test")
     {
-        DTest();
-    }
-    else if (cmd == "gtest")
-    {
-        GTest();
+        Test();
     }
     else
     {
@@ -32,8 +36,7 @@ static void Main()
 
 static decimal ReluPrimeFromActivation(decimal a)
 {
-    // a = ReLU(z)이면 a>0 <=> z>0 이므로 이 마스크로 도함수 처리 가능(0은 관례적으로 0 처리)
-    return a > 0 ? 1m : 0m;
+    return a > 0m ? 1m : 0m;
 }
 
 static decimal Relu(decimal x)
@@ -41,23 +44,22 @@ static decimal Relu(decimal x)
     return x > 0m ? x : 0m;
 }
 
-const decimal UpdateActivationClip = 10m;
-const decimal UpdateDeltaClip = 10m;
-const decimal UpdateGradientClip = 25m;
-const decimal WeightClip = 5m;
+static decimal Sigmoid(decimal x)
+{
+    double z = Math.Clamp(Convert.ToDouble(x), -40.0, 40.0);
+    return Convert.ToDecimal(1.0 / (1.0 + Math.Exp(-z)));
+}
+
+static decimal SigmoidPrimeFromActivation(decimal y)
+{
+    return y * (1m - y);
+}
 
 static decimal Clamp(decimal value, decimal min, decimal max)
 {
     if (value < min) return min;
     if (value > max) return max;
     return value;
-}
-
-static decimal Sigmoid(decimal x)
-{
-    double z = Math.Clamp(Convert.ToDouble(x), -40.0, 40.0);
-    double y = 1.0 / (1.0 + Math.Exp(-z));
-    return Convert.ToDecimal(y);
 }
 
 static decimal ApplyWeightUpdate(decimal weight, decimal activation, decimal delta, decimal learningRate)
@@ -71,14 +73,12 @@ static decimal ApplyWeightUpdate(decimal weight, decimal activation, decimal del
 
 static decimal NormalizedPixelValue(Color pixelColor)
 {
-    // MNIST는 흰 배경/검은 글자이므로 반전해 글자(전경)가 큰 값이 되도록 맞춘다.
     decimal gray = Convert.ToDecimal(((0.299 * pixelColor.R) + (0.587 * pixelColor.G) + (0.114 * pixelColor.B)) / 255.0);
     return 1m - gray;
 }
 
 static decimal XavierUniformWeight(Random rand, int fanIn)
 {
-    // 너무 큰 초기값으로 출력이 폭주하지 않도록 fan-in 기반으로 초기화 범위를 제한
     double limit = Math.Sqrt(6.0 / fanIn);
     double sampled = ((rand.NextDouble() * 2.0) - 1.0) * limit;
     return Convert.ToDecimal(sampled);
@@ -87,19 +87,67 @@ static decimal XavierUniformWeight(Random rand, int fanIn)
 static int ReadPositiveEnvInt(string key)
 {
     string? raw = Environment.GetEnvironmentVariable(key);
-    if (int.TryParse(raw, out int parsed) && parsed > 0)
+    if (int.TryParse(raw, out int parsed) && parsed > 0) return parsed;
+    return 0;
+}
+
+static void SetDiscriminatorCondition(Node[] dInput, int label)
+{
+    int condStart = ImageVectorSize;
+    for (int i = 0; i < ConditionVectorSize; i++)
     {
-        return parsed;
+        dInput[condStart + i].x = i == label ? 1m : 0m;
+    }
+}
+
+static decimal ForwardDiscriminator(Node[] dInput, Node[] dHidden1, Node[] dHidden2, Node[] dOutput)
+{
+    for (int h1 = 0; h1 < dHidden1.Length; h1++)
+    {
+        dHidden1[h1].Calculate(dInput, h1);
     }
 
-    return 0;
+    for (int h2 = 0; h2 < dHidden2.Length; h2++)
+    {
+        dHidden2[h2].CalculateReLU(dHidden1, h2);
+    }
+
+    dOutput[0].Calculate(dHidden2, 0);
+    dOutput[0].x = Sigmoid(dOutput[0].x);
+    return dOutput[0].x;
+}
+
+static void ForwardGenerator(Node[] gInput, Node[] gHidden1, Node[] gHidden2, Node[] gOutput)
+{
+    for (int h1 = 0; h1 < gHidden1.Length; h1++)
+    {
+        gHidden1[h1].Calculate(gInput, h1);
+    }
+
+    for (int h2 = 0; h2 < gHidden2.Length; h2++)
+    {
+        gHidden2[h2].CalculateReLU(gHidden1, h2);
+    }
+
+    for (int o = 0; o < gOutput.Length; o++)
+    {
+        gOutput[o].Calculate(gHidden2, o);
+        gOutput[o].x = Sigmoid(gOutput[o].x);
+    }
 }
 
 static void Train()
 {
-    DirectoryInfo di = new DirectoryInfo(System.Environment.CurrentDirectory + @"/mnist_png/training");
-    List<ImageData> imageDatas = new List<ImageData>();
-    foreach (var subdir in di.GetDirectories())
+    string trainDirPath = Path.Combine(Environment.CurrentDirectory, "mnist_png", "training");
+    if (!Directory.Exists(trainDirPath))
+    {
+        Console.WriteLine($"Training directory not found: {trainDirPath}");
+        return;
+    }
+
+    var trainDir = new DirectoryInfo(trainDirPath);
+    var imageDatas = new List<ImageData>();
+    foreach (var subdir in trainDir.GetDirectories())
     {
         Console.WriteLine(subdir.FullName);
         foreach (var file in subdir.GetFiles())
@@ -108,7 +156,7 @@ static void Train()
         }
     }
 
-    imageDatas.Sort(((a, b) => { if (a.FileName == b.FileName) return 0; else return (a.FileName < b.FileName) ? 1 : -1; }));
+    imageDatas.Sort((a, b) => a.FileName.CompareTo(b.FileName));
     int maxTrainSamples = ReadPositiveEnvInt("MAX_TRAIN_SAMPLES");
     if (maxTrainSamples > 0 && maxTrainSamples < imageDatas.Count)
     {
@@ -116,471 +164,281 @@ static void Train()
         Console.WriteLine($"Training sample limit enabled: {imageDatas.Count}");
     }
 
-    Node[] D_input = new Node[28 * 28];
-    Node[] D_hidden1 = new Node[128];
-    Node[] D_hidden2 = new Node[128];
-    Node[] D_output = new Node[11];
-    Node[] G_input = new Node[10];
-    Node[] G_hidden1 = new Node[128];
-    Node[] G_hidden2 = new Node[128];
-    Node[] G_output = new Node[28 * 28];
+    Node[] dInput = new Node[ImageVectorSize + ConditionVectorSize];
+    Node[] dHidden1 = new Node[HiddenSize];
+    Node[] dHidden2 = new Node[HiddenSize];
+    Node[] dOutput = new Node[1]; // one-dimensional discriminator output (realness)
+
+    Node[] gInput = new Node[ConditionVectorSize];
+    Node[] gHidden1 = new Node[HiddenSize];
+    Node[] gHidden2 = new Node[HiddenSize];
+    Node[] gOutput = new Node[ImageVectorSize];
+
     Random rand = new Random(DateTime.Now.Millisecond);
-    decimal updateRate = 0.001m;
-    for (int i = 0; i < 28 * 28; i++)
+    decimal updateRate = 0.0002m;
+
+    for (int i = 0; i < dInput.Length; i++)
     {
-        decimal[] w = new decimal[128];
-        for (int j = 0; j < 128; j++)
-        {
-            w[j] = XavierUniformWeight(rand, 28 * 28);
-        }
-        D_input[i] = new Node(w);
+        decimal[] w = new decimal[HiddenSize];
+        for (int j = 0; j < HiddenSize; j++) w[j] = XavierUniformWeight(rand, dInput.Length);
+        dInput[i] = new Node(w);
     }
 
-    for (int i = 0; i < 128; i++)
+    for (int i = 0; i < dHidden1.Length; i++)
     {
-        decimal[] w = new decimal[128];
-        for (int j = 0; j < 128; j++)
-        {
-            w[j] = XavierUniformWeight(rand, 128);
-        }
-        D_hidden1[i] = new Node(w);
+        decimal[] w = new decimal[HiddenSize];
+        for (int j = 0; j < HiddenSize; j++) w[j] = XavierUniformWeight(rand, HiddenSize);
+        dHidden1[i] = new Node(w);
     }
 
-    for (int i = 0; i < 128; i++)
+    for (int i = 0; i < dHidden2.Length; i++)
     {
-        decimal[] w = new decimal[11];
-        for (int j = 0; j < 11; j++)
-        {
-            w[j] = XavierUniformWeight(rand, 128);
-        }
-        D_hidden2[i] = new Node(w);
+        decimal[] w = new decimal[1];
+        w[0] = XavierUniformWeight(rand, HiddenSize);
+        dHidden2[i] = new Node(w);
+    }
+    dOutput[0] = new Node();
+
+    for (int i = 0; i < gInput.Length; i++)
+    {
+        decimal[] w = new decimal[HiddenSize];
+        for (int j = 0; j < HiddenSize; j++) w[j] = XavierUniformWeight(rand, gInput.Length);
+        gInput[i] = new Node(w);
     }
 
-    for (int i = 0; i < 11; i++)
+    for (int i = 0; i < gHidden1.Length; i++)
     {
-        D_output[i] = new Node();
+        decimal[] w = new decimal[HiddenSize];
+        for (int j = 0; j < HiddenSize; j++) w[j] = XavierUniformWeight(rand, HiddenSize);
+        gHidden1[i] = new Node(w);
     }
 
-    for (int i = 0; i < 10; i++)
+    for (int i = 0; i < gHidden2.Length; i++)
     {
-        decimal[] w = new decimal[128];
-        for (int j = 0; j < 128; j++)
-        {
-            w[j] = XavierUniformWeight(rand, 10);
-        }
-        G_input[i] = new Node(w);
+        decimal[] w = new decimal[ImageVectorSize];
+        for (int j = 0; j < ImageVectorSize; j++) w[j] = XavierUniformWeight(rand, HiddenSize);
+        gHidden2[i] = new Node(w);
     }
 
-    for (int i = 0; i < 128; i++)
-    {
-        decimal[] w = new decimal[128];
-        for (int j = 0; j < 128; j++)
-        {
-            w[j] = XavierUniformWeight(rand, 128);
-        }
-        G_hidden1[i] = new Node(w);
-    }
+    for (int i = 0; i < gOutput.Length; i++) gOutput[i] = new Node();
 
-    for (int i = 0; i < 128; i++)
-    {
-        decimal[] w = new decimal[28 * 28];
-        for (int j = 0; j < 28 * 28; j++)
-        {
-            w[j] = XavierUniformWeight(rand, 128);
-        }
-        G_hidden2[i] = new Node(w);
-    }
+    int epochs = ReadPositiveEnvInt("EPOCHS");
+    if (epochs <= 0) epochs = 10;
 
-    for (int i = 0; i < 28 * 28; i++)
-    {
-        G_output[i] = new Node();
-    }
-    int epochs = 10;
     for (int epoch = 0; epoch < epochs; epoch++)
     {
-        Console.WriteLine($"Epoch {epoch + 1}/{epochs}");
-        foreach (var imageData in imageDatas)
+        for (int i = imageDatas.Count - 1; i > 0; i--)
         {
-            Bitmap bitmap = new Bitmap(imageData.ImagePath);
+            int j = rand.Next(i + 1);
+            (imageDatas[i], imageDatas[j]) = (imageDatas[j], imageDatas[i]);
+        }
+
+        Console.WriteLine($"Epoch {epoch + 1}/{epochs}");
+        for (int sampleIndex = 0; sampleIndex < imageDatas.Count; sampleIndex++)
+        {
+            var imageData = imageDatas[sampleIndex];
+            using Bitmap bitmap = new Bitmap(imageData.ImagePath);
 
             for (int i = 0; i < bitmap.Width; i++)
             {
                 for (int j = 0; j < bitmap.Height; j++)
                 {
-                    Color pixelColor = bitmap.GetPixel(i, j);
-                    D_input[i * 28 + j].x = NormalizedPixelValue(pixelColor);
+                    dInput[i * 28 + j].x = NormalizedPixelValue(bitmap.GetPixel(i, j));
                 }
             }
-            int generatedDigit = rand.Next(10);
-            for (int i = 0; i < G_input.Length; i++)
+            SetDiscriminatorCondition(dInput, imageData.Label);
+
+            int generatedDigit = rand.Next(ConditionVectorSize);
+            for (int i = 0; i < gInput.Length; i++)
             {
-                G_input[i].x = i == generatedDigit ? 1m : 0m;
+                gInput[i].x = i == generatedDigit ? 1m : 0m;
             }
-            for (int h1 = 0; h1 < G_hidden1.Length; h1++)
+            ForwardGenerator(gInput, gHidden1, gHidden2, gOutput);
+
+            // D(real): target = 1
+            decimal dReal = ForwardDiscriminator(dInput, dHidden1, dHidden2, dOutput);
+            decimal deltaOutReal = dReal - 1m;
+
+            decimal[] delta2Real = new decimal[dHidden2.Length];
+            for (int h2 = 0; h2 < dHidden2.Length; h2++)
             {
-                G_hidden1[h1].Calculate(G_input, h1);
-            }
-            for (int h2 = 0; h2 < G_hidden2.Length; h2++)
-            {
-                G_hidden2[h2].CalculateReLU(G_hidden1, h2);
-            }
-            for (int o = 0; o < G_output.Length; o++)
-            {
-                G_output[o].Calculate(G_hidden2, o);
-                G_output[o].x = Sigmoid(G_output[o].x); // sigmoid으로 확률화
-            }
-            for (int h1 = 0; h1 < D_hidden1.Length; h1++)
-            {
-                D_hidden1[h1].Calculate(D_input, h1);
-            }
-            for (int h2 = 0; h2 < D_hidden2.Length; h2++)
-            {
-                D_hidden2[h2].CalculateReLU(D_hidden1, h2);
-            }
-            for (int o = 0; o < D_output.Length; o++)
-            {
-                D_output[o].Calculate(D_hidden2, o);
-                D_output[o].x = Sigmoid(D_output[o].x); // sigmoid으로 확률화
-            }
-            // D(real): 정답 숫자(0~9) one-hot 타깃으로 학습
-            decimal[] deltaOutReal = new decimal[D_output.Length];
-            for (int o = 0; o < D_output.Length; o++)
-            {
-                decimal target = (o == imageData.Label) ? 1m : 0m;
-                deltaOutReal[o] = D_output[o].x - target;
+                delta2Real[h2] = dHidden2[h2].weights[0] * deltaOutReal;
             }
 
-            decimal[] delta2Real = new decimal[D_hidden2.Length];
-            for (int h2 = 0; h2 < D_hidden2.Length; h2++)
+            decimal[] delta1Real = new decimal[dHidden1.Length];
+            for (int h1 = 0; h1 < dHidden1.Length; h1++)
             {
                 decimal sum = 0m;
-                for (int o = 0; o < D_output.Length; o++)
-                {
-                    sum += D_hidden2[h2].weights[o] * deltaOutReal[o];
-                }
-                delta2Real[h2] = sum;
+                for (int h2 = 0; h2 < dHidden2.Length; h2++) sum += dHidden1[h1].weights[h2] * delta2Real[h2];
+                delta1Real[h1] = sum * ReluPrimeFromActivation(dHidden1[h1].x);
             }
 
-            decimal[] delta1Real = new decimal[D_hidden1.Length];
-            for (int h1 = 0; h1 < D_hidden1.Length; h1++)
+            for (int h2 = 0; h2 < dHidden2.Length; h2++)
+            {
+                dHidden2[h2].weights[0] = ApplyWeightUpdate(dHidden2[h2].weights[0], dHidden2[h2].x, deltaOutReal, updateRate);
+            }
+
+            for (int h1 = 0; h1 < dHidden1.Length; h1++)
+            {
+                for (int h2 = 0; h2 < dHidden2.Length; h2++)
+                {
+                    dHidden1[h1].weights[h2] = ApplyWeightUpdate(dHidden1[h1].weights[h2], Relu(dHidden1[h1].x), delta2Real[h2], updateRate);
+                }
+            }
+
+            for (int inp = 0; inp < dInput.Length; inp++)
+            {
+                for (int h1 = 0; h1 < dHidden1.Length; h1++)
+                {
+                    dInput[inp].weights[h1] = ApplyWeightUpdate(dInput[inp].weights[h1], dInput[inp].x, delta1Real[h1], updateRate);
+                }
+            }
+
+            // D(fake): target = 0
+            for (int i = 0; i < ImageVectorSize; i++) dInput[i].x = gOutput[i].x;
+            SetDiscriminatorCondition(dInput, generatedDigit);
+
+            decimal dFake = ForwardDiscriminator(dInput, dHidden1, dHidden2, dOutput);
+            decimal deltaOutFake = dFake - 0m;
+
+            decimal[] delta2Fake = new decimal[dHidden2.Length];
+            for (int h2 = 0; h2 < dHidden2.Length; h2++)
+            {
+                delta2Fake[h2] = dHidden2[h2].weights[0] * deltaOutFake;
+            }
+
+            decimal[] delta1Fake = new decimal[dHidden1.Length];
+            for (int h1 = 0; h1 < dHidden1.Length; h1++)
             {
                 decimal sum = 0m;
-                for (int h2 = 0; h2 < D_hidden2.Length; h2++)
-                {
-                    sum += D_hidden1[h1].weights[h2] * delta2Real[h2];
-                }
-                delta1Real[h1] = sum * ReluPrimeFromActivation(D_hidden1[h1].x);
+                for (int h2 = 0; h2 < dHidden2.Length; h2++) sum += dHidden1[h1].weights[h2] * delta2Fake[h2];
+                delta1Fake[h1] = sum * ReluPrimeFromActivation(dHidden1[h1].x);
             }
 
-            for (int h2 = 0; h2 < D_hidden2.Length; h2++)
+            for (int h2 = 0; h2 < dHidden2.Length; h2++)
             {
-                for (int o = 0; o < D_output.Length; o++)
+                dHidden2[h2].weights[0] = ApplyWeightUpdate(dHidden2[h2].weights[0], dHidden2[h2].x, deltaOutFake, updateRate);
+            }
+
+            for (int h1 = 0; h1 < dHidden1.Length; h1++)
+            {
+                for (int h2 = 0; h2 < dHidden2.Length; h2++)
                 {
-                    D_hidden2[h2].weights[o] = ApplyWeightUpdate(
-                        D_hidden2[h2].weights[o],
-                        D_hidden2[h2].x,
-                        deltaOutReal[o],
-                        updateRate
-                    );
+                    dHidden1[h1].weights[h2] = ApplyWeightUpdate(dHidden1[h1].weights[h2], Relu(dHidden1[h1].x), delta2Fake[h2], updateRate);
                 }
             }
 
-            for (int h1 = 0; h1 < D_hidden1.Length; h1++)
+            for (int inp = 0; inp < dInput.Length; inp++)
             {
-                for (int h2 = 0; h2 < D_hidden2.Length; h2++)
+                for (int h1 = 0; h1 < dHidden1.Length; h1++)
                 {
-                    D_hidden1[h1].weights[h2] = ApplyWeightUpdate(
-                        D_hidden1[h1].weights[h2],
-                        Relu(D_hidden1[h1].x),
-                        delta2Real[h2],
-                        updateRate
-                    );
+                    dInput[inp].weights[h1] = ApplyWeightUpdate(dInput[inp].weights[h1], dInput[inp].x, delta1Fake[h1], updateRate);
                 }
             }
 
-            for (int inp = 0; inp < D_input.Length; inp++)
+            // G step: wants D(fake) -> 1
+            for (int i = 0; i < ImageVectorSize; i++) dInput[i].x = gOutput[i].x;
+            SetDiscriminatorCondition(dInput, generatedDigit);
+
+            decimal dForG = ForwardDiscriminator(dInput, dHidden1, dHidden2, dOutput);
+            decimal deltaOutForG = dForG - 1m;
+
+            decimal[] dDelta2ForG = new decimal[dHidden2.Length];
+            for (int h2 = 0; h2 < dHidden2.Length; h2++)
             {
-                for (int h1 = 0; h1 < D_hidden1.Length; h1++)
-                {
-                    D_input[inp].weights[h1] = ApplyWeightUpdate(
-                        D_input[inp].weights[h1],
-                        D_input[inp].x,
-                        delta1Real[h1],
-                        updateRate
-                    );
-                }
+                dDelta2ForG[h2] = dHidden2[h2].weights[0] * deltaOutForG;
             }
 
-            // D(fake): 생성 샘플은 fake 클래스(index 10)가 1이 되도록 학습
-            for (int i = 0; i < D_input.Length && i < G_output.Length; i++)
-            {
-                D_input[i].x = G_output[i].x;
-            }
-
-            for (int h1 = 0; h1 < D_hidden1.Length; h1++)
-            {
-                D_hidden1[h1].Calculate(D_input, h1);
-            }
-            for (int h2 = 0; h2 < D_hidden2.Length; h2++)
-            {
-                D_hidden2[h2].CalculateReLU(D_hidden1, h2);
-            }
-            for (int o = 0; o < D_output.Length; o++)
-            {
-                D_output[o].Calculate(D_hidden2, o);
-                D_output[o].x = Sigmoid(D_output[o].x); // sigmoid으로 확률화
-            }
-
-            int fakeClassIndex = D_output.Length - 1;
-            decimal[] deltaOutFake = new decimal[D_output.Length];
-            for (int o = 0; o < D_output.Length; o++)
-            {
-                decimal target = (o == fakeClassIndex) ? 1m : 0m;
-                deltaOutFake[o] = D_output[o].x - target;
-            }
-
-            decimal[] delta2Fake = new decimal[D_hidden2.Length];
-            for (int h2 = 0; h2 < D_hidden2.Length; h2++)
+            decimal[] dDelta1ForG = new decimal[dHidden1.Length];
+            for (int h1 = 0; h1 < dHidden1.Length; h1++)
             {
                 decimal sum = 0m;
-                for (int o = 0; o < D_output.Length; o++)
-                {
-                    sum += D_hidden2[h2].weights[o] * deltaOutFake[o];
-                }
-                delta2Fake[h2] = sum;
+                for (int h2 = 0; h2 < dHidden2.Length; h2++) sum += dHidden1[h1].weights[h2] * dDelta2ForG[h2];
+                dDelta1ForG[h1] = sum * ReluPrimeFromActivation(dHidden1[h1].x);
             }
 
-            decimal[] delta1Fake = new decimal[D_hidden1.Length];
-            for (int h1 = 0; h1 < D_hidden1.Length; h1++)
+            decimal[] gDeltaOut = new decimal[gOutput.Length];
+            for (int go = 0; go < gOutput.Length; go++)
             {
                 decimal sum = 0m;
-                for (int h2 = 0; h2 < D_hidden2.Length; h2++)
-                {
-                    sum += D_hidden1[h1].weights[h2] * delta2Fake[h2];
-                }
-                delta1Fake[h1] = sum * ReluPrimeFromActivation(D_hidden1[h1].x);
+                for (int h1 = 0; h1 < dHidden1.Length; h1++) sum += dInput[go].weights[h1] * dDelta1ForG[h1];
+                gDeltaOut[go] = sum * SigmoidPrimeFromActivation(gOutput[go].x);
             }
 
-            for (int h2 = 0; h2 < D_hidden2.Length; h2++)
-            {
-                for (int o = 0; o < D_output.Length; o++)
-                {
-                    D_hidden2[h2].weights[o] = ApplyWeightUpdate(
-                        D_hidden2[h2].weights[o],
-                        D_hidden2[h2].x,
-                        deltaOutFake[o],
-                        updateRate
-                    );
-                }
-            }
-
-            for (int h1 = 0; h1 < D_hidden1.Length; h1++)
-            {
-                for (int h2 = 0; h2 < D_hidden2.Length; h2++)
-                {
-                    D_hidden1[h1].weights[h2] = ApplyWeightUpdate(
-                        D_hidden1[h1].weights[h2],
-                        Relu(D_hidden1[h1].x),
-                        delta2Fake[h2],
-                        updateRate
-                    );
-                }
-            }
-
-            for (int inp = 0; inp < D_input.Length; inp++)
-            {
-                for (int h1 = 0; h1 < D_hidden1.Length; h1++)
-                {
-                    D_input[inp].weights[h1] = ApplyWeightUpdate(
-                        D_input[inp].weights[h1],
-                        D_input[inp].x,
-                        delta1Fake[h1],
-                        updateRate
-                    );
-                }
-            }
-
-            // G 업데이트: D(fake)의 그래디언트를 D 입력(=G 출력)까지 전파한 뒤 G 파라미터를 갱신한다.
-            for (int i = 0; i < D_input.Length && i < G_output.Length; i++)
-            {
-                D_input[i].x = G_output[i].x;
-            }
-            for (int h1 = 0; h1 < D_hidden1.Length; h1++)
-            {
-                D_hidden1[h1].Calculate(D_input, h1);
-            }
-            for (int h2 = 0; h2 < D_hidden2.Length; h2++)
-            {
-                D_hidden2[h2].CalculateReLU(D_hidden1, h2);
-            }
-            for (int o = 0; o < D_output.Length; o++)
-            {
-                D_output[o].Calculate(D_hidden2, o);
-                D_output[o].x = Sigmoid(D_output[o].x);
-            }
-
-            decimal[] dDeltaOutForG = new decimal[D_output.Length];
-            for (int o = 0; o < D_output.Length; o++)
-            {
-                decimal target = (o == generatedDigit) ? 1m : 0m;
-                dDeltaOutForG[o] = D_output[o].x - target;
-            }
-
-            decimal[] dDelta2ForG = new decimal[D_hidden2.Length];
-            for (int h2 = 0; h2 < D_hidden2.Length; h2++)
+            decimal[] gDelta2 = new decimal[gHidden2.Length];
+            for (int h2 = 0; h2 < gHidden2.Length; h2++)
             {
                 decimal sum = 0m;
-                for (int o = 0; o < D_output.Length; o++)
-                {
-                    sum += D_hidden2[h2].weights[o] * dDeltaOutForG[o];
-                }
-                dDelta2ForG[h2] = sum;
-            }
-
-            decimal[] dDelta1ForG = new decimal[D_hidden1.Length];
-            for (int h1 = 0; h1 < D_hidden1.Length; h1++)
-            {
-                decimal sum = 0m;
-                for (int h2 = 0; h2 < D_hidden2.Length; h2++)
-                {
-                    sum += D_hidden1[h1].weights[h2] * dDelta2ForG[h2];
-                }
-                dDelta1ForG[h1] = sum * ReluPrimeFromActivation(D_hidden1[h1].x);
-            }
-
-            int gOutConnected = G_hidden2.Length > 0 ? G_hidden2[0].weights.Length : 0;
-            int gOutUsed = Math.Min(Math.Min(G_output.Length, D_input.Length), gOutConnected);
-            decimal[] gDeltaOut = new decimal[gOutUsed];
-            for (int go = 0; go < gOutUsed; go++)
-            {
-                decimal sum = 0m;
-                for (int h1 = 0; h1 < D_hidden1.Length; h1++)
-                {
-                    sum += D_input[go].weights[h1] * dDelta1ForG[h1];
-                }
-                gDeltaOut[go] = sum;
-            }
-
-            decimal[] gDelta2 = new decimal[G_hidden2.Length];
-            for (int h2 = 0; h2 < G_hidden2.Length; h2++)
-            {
-                decimal sum = 0m;
-                for (int go = 0; go < gOutUsed; go++)
-                {
-                    sum += G_hidden2[h2].weights[go] * gDeltaOut[go];
-                }
+                for (int go = 0; go < gOutput.Length; go++) sum += gHidden2[h2].weights[go] * gDeltaOut[go];
                 gDelta2[h2] = sum;
             }
 
-            decimal[] gDelta1 = new decimal[G_hidden1.Length];
-            for (int h1 = 0; h1 < G_hidden1.Length; h1++)
+            decimal[] gDelta1 = new decimal[gHidden1.Length];
+            for (int h1 = 0; h1 < gHidden1.Length; h1++)
             {
                 decimal sum = 0m;
-                for (int h2 = 0; h2 < G_hidden2.Length; h2++)
-                {
-                    sum += G_hidden1[h1].weights[h2] * gDelta2[h2];
-                }
-                gDelta1[h1] = sum * ReluPrimeFromActivation(G_hidden1[h1].x);
+                for (int h2 = 0; h2 < gHidden2.Length; h2++) sum += gHidden1[h1].weights[h2] * gDelta2[h2];
+                gDelta1[h1] = sum * ReluPrimeFromActivation(gHidden1[h1].x);
             }
 
-            for (int h2 = 0; h2 < G_hidden2.Length; h2++)
+            for (int h2 = 0; h2 < gHidden2.Length; h2++)
             {
-                for (int go = 0; go < gOutUsed; go++)
+                for (int go = 0; go < gOutput.Length; go++)
                 {
-                    G_hidden2[h2].weights[go] = ApplyWeightUpdate(
-                        G_hidden2[h2].weights[go],
-                        Relu(G_hidden2[h2].x),
-                        gDeltaOut[go],
-                        updateRate
-                    );
+                    gHidden2[h2].weights[go] = ApplyWeightUpdate(gHidden2[h2].weights[go], gHidden2[h2].x, gDeltaOut[go], updateRate);
                 }
             }
 
-            for (int h1 = 0; h1 < G_hidden1.Length; h1++)
+            for (int h1 = 0; h1 < gHidden1.Length; h1++)
             {
-                for (int h2 = 0; h2 < G_hidden2.Length; h2++)
+                for (int h2 = 0; h2 < gHidden2.Length; h2++)
                 {
-                    G_hidden1[h1].weights[h2] = ApplyWeightUpdate(
-                        G_hidden1[h1].weights[h2],
-                        Relu(G_hidden1[h1].x),
-                        gDelta2[h2],
-                        updateRate
-                    );
+                    gHidden1[h1].weights[h2] = ApplyWeightUpdate(gHidden1[h1].weights[h2], Relu(gHidden1[h1].x), gDelta2[h2], updateRate);
                 }
             }
 
-            for (int inp = 0; inp < G_input.Length; inp++)
+            for (int inp = 0; inp < gInput.Length; inp++)
             {
-                for (int h1 = 0; h1 < G_hidden1.Length; h1++)
+                for (int h1 = 0; h1 < gHidden1.Length; h1++)
                 {
-                    G_input[inp].weights[h1] = ApplyWeightUpdate(
-                        G_input[inp].weights[h1],
-                        G_input[inp].x,
-                        gDelta1[h1],
-                        updateRate
-                    );
+                    gInput[inp].weights[h1] = ApplyWeightUpdate(gInput[inp].weights[h1], gInput[inp].x, gDelta1[h1], updateRate);
                 }
             }
 
-
-            Console.WriteLine($"epoch#{epoch + 1} {imageDatas.IndexOf(imageData) + 1}/{imageDatas.Count}");
+            Console.WriteLine($"epoch#{epoch + 1} {sampleIndex + 1}/{imageDatas.Count}");
         }
-    }
-    {
+
         string modelPath = Path.Combine(Environment.CurrentDirectory, "model_weights.txt");
         using (var sw = new StreamWriter(modelPath, false))
         {
             sw.WriteLine("# D_input");
-            foreach (var n in D_input)
-            {
-                sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
-            }
+            foreach (var n in dInput) sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
 
             sw.WriteLine("# D_hidden1");
-            foreach (var n in D_hidden1)
-            {
-                sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
-            }
+            foreach (var n in dHidden1) sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
 
             sw.WriteLine("# D_hidden2");
-            foreach (var n in D_hidden2)
-            {
-                sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
-            }
+            foreach (var n in dHidden2) sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
 
             sw.WriteLine("# D_output");
-            foreach (var n in D_output)
-            {
-                sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
-            }
+            foreach (var n in dOutput) sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
+
             sw.WriteLine("# G_input");
-            foreach (var n in G_input)
-            {
-                sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
-            }
+            foreach (var n in gInput) sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
 
             sw.WriteLine("# G_hidden1");
-            foreach (var n in G_hidden1)
-            {
-                sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
-            }
+            foreach (var n in gHidden1) sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
 
             sw.WriteLine("# G_hidden2");
-            foreach (var n in G_hidden2)
-            {
-                sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
-            }
+            foreach (var n in gHidden2) sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
 
             sw.WriteLine("# G_output");
-            foreach (var n in G_output)
-            {
-                sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
-            }
+            foreach (var n in gOutput) sw.WriteLine(string.Join(",", n.weights.Select(w => w.ToString(CultureInfo.InvariantCulture))));
         }
     }
 }
 
-static void GTest()
+static void Test()
 {
     Console.WriteLine("Enter a digit to generate (0-9):");
     string? rawDigit = Console.ReadLine()?.Trim();
@@ -590,15 +448,15 @@ static void GTest()
         return;
     }
 
-    Node[] G_input = new Node[10];
-    Node[] G_hidden1 = new Node[128];
-    Node[] G_hidden2 = new Node[128];
-    Node[] G_output = new Node[28 * 28];
+    Node[] gInput = new Node[ConditionVectorSize];
+    Node[] gHidden1 = new Node[HiddenSize];
+    Node[] gHidden2 = new Node[HiddenSize];
+    Node[] gOutput = new Node[ImageVectorSize];
 
-    for (int i = 0; i < G_input.Length; i++) G_input[i] = new Node(new decimal[128]);
-    for (int i = 0; i < G_hidden1.Length; i++) G_hidden1[i] = new Node(new decimal[128]);
-    for (int i = 0; i < G_hidden2.Length; i++) G_hidden2[i] = new Node(new decimal[28 * 28]);
-    for (int i = 0; i < G_output.Length; i++) G_output[i] = new Node();
+    for (int i = 0; i < gInput.Length; i++) gInput[i] = new Node(new decimal[HiddenSize]);
+    for (int i = 0; i < gHidden1.Length; i++) gHidden1[i] = new Node(new decimal[HiddenSize]);
+    for (int i = 0; i < gHidden2.Length; i++) gHidden2[i] = new Node(new decimal[ImageVectorSize]);
+    for (int i = 0; i < gOutput.Length; i++) gOutput[i] = new Node();
 
     string modelPath = Path.Combine(Environment.CurrentDirectory, "model_weights.txt");
     if (!File.Exists(modelPath))
@@ -610,38 +468,31 @@ static void GTest()
     var lines = File.ReadAllLines(modelPath).Select(l => l.Trim()).Where(l => l.Length > 0).ToList();
     string section = "";
     int inpIndex = 0, h1Index = 0, h2Index = 0;
+
     foreach (var line in lines)
     {
         if (line.StartsWith("#"))
         {
-            if (line.Contains("G_input")) section = "G_input";
-            else if (line.Contains("G_hidden1")) section = "G_hidden1";
-            else if (line.Contains("G_hidden2")) section = "G_hidden2";
-            else section = "";
-            continue;
-        }
-
-        if (section != "G_input" && section != "G_hidden1" && section != "G_hidden2")
-        {
+            section = line.Substring(1).Trim();
             continue;
         }
 
         var parts = line.Split(',');
         try
         {
-            if (section == "G_input" && inpIndex < G_input.Length)
+            if (section == "G_input" && inpIndex < gInput.Length)
             {
-                G_input[inpIndex].weights = parts.Select(p => decimal.Parse(p, CultureInfo.InvariantCulture)).ToArray();
+                gInput[inpIndex].weights = parts.Select(p => decimal.Parse(p, CultureInfo.InvariantCulture)).ToArray();
                 inpIndex++;
             }
-            else if (section == "G_hidden1" && h1Index < G_hidden1.Length)
+            else if (section == "G_hidden1" && h1Index < gHidden1.Length)
             {
-                G_hidden1[h1Index].weights = parts.Select(p => decimal.Parse(p, CultureInfo.InvariantCulture)).ToArray();
+                gHidden1[h1Index].weights = parts.Select(p => decimal.Parse(p, CultureInfo.InvariantCulture)).ToArray();
                 h1Index++;
             }
-            else if (section == "G_hidden2" && h2Index < G_hidden2.Length)
+            else if (section == "G_hidden2" && h2Index < gHidden2.Length)
             {
-                G_hidden2[h2Index].weights = parts.Select(p => decimal.Parse(p, CultureInfo.InvariantCulture)).ToArray();
+                gHidden2[h2Index].weights = parts.Select(p => decimal.Parse(p, CultureInfo.InvariantCulture)).ToArray();
                 h2Index++;
             }
         }
@@ -652,44 +503,14 @@ static void GTest()
         }
     }
 
-    if (inpIndex < G_input.Length || h1Index < G_hidden1.Length || h2Index < G_hidden2.Length)
+    if (inpIndex < gInput.Length || h1Index < gHidden1.Length || h2Index < gHidden2.Length)
     {
         Console.WriteLine("G model weights are incomplete in model_weights.txt.");
         return;
     }
 
-    int gOutConnected = G_hidden2.Min(n => n.weights.Length);
-    int generatedOutputCount = Math.Min(G_output.Length, gOutConnected);
-    if (generatedOutputCount <= 0)
-    {
-        Console.WriteLine("G model output weights are invalid.");
-        return;
-    }
-
-    for (int i = 0; i < G_input.Length; i++)
-    {
-        G_input[i].x = i == digit ? 1m : 0m;
-    }
-
-    for (int h1 = 0; h1 < G_hidden1.Length; h1++)
-    {
-        G_hidden1[h1].Calculate(G_input, h1);
-    }
-
-    for (int h2 = 0; h2 < G_hidden2.Length; h2++)
-    {
-        G_hidden2[h2].CalculateReLU(G_hidden1, h2);
-    }
-
-    for (int o = 0; o < generatedOutputCount; o++)
-    {
-        G_output[o].Calculate(G_hidden2, o);
-        G_output[o].x = Sigmoid(G_output[o].x);
-    }
-    for (int o = generatedOutputCount; o < G_output.Length; o++)
-    {
-        G_output[o].x = 0m;
-    }
+    for (int i = 0; i < gInput.Length; i++) gInput[i].x = i == digit ? 1m : 0m;
+    ForwardGenerator(gInput, gHidden1, gHidden2, gOutput);
 
     string outputPath = Path.Combine(Environment.CurrentDirectory, $"{digit}.png");
     using (Bitmap bitmap = new Bitmap(28, 28))
@@ -699,153 +520,14 @@ static void GTest()
             for (int j = 0; j < 28; j++)
             {
                 int index = i * 28 + j;
-                decimal foreground = G_output[index].x;
-                if (foreground < 0m) foreground = 0m;
-                if (foreground > 1m) foreground = 1m;
-
+                decimal foreground = Clamp(gOutput[index].x, 0m, 1m);
                 int gray = Convert.ToInt32(Math.Round(Convert.ToDouble((1m - foreground) * 255m)));
                 gray = Math.Clamp(gray, 0, 255);
                 bitmap.SetPixel(i, j, Color.FromArgb(gray, gray, gray));
             }
         }
-
         bitmap.Save(outputPath);
     }
 
     Console.WriteLine($"Generated image saved: {outputPath}");
-    if (generatedOutputCount < G_output.Length)
-    {
-        Console.WriteLine($"Warning: G_hidden2 output width is {generatedOutputCount}, so remaining pixels were filled with 0.");
-    }
-}
-
-static void DTest()
-{
-    // Prepare nodes structures
-    Node[] D_input = new Node[28 * 28];
-    Node[] D_hidden1 = new Node[128];
-    Node[] D_hidden2 = new Node[128];
-    Node[] D_output = new Node[11];
-
-    // Initialize with default arrays to be replaced by loaded weights
-    for (int i = 0; i < D_input.Length; i++) D_input[i] = new Node(new decimal[128]);
-    for (int i = 0; i < D_hidden1.Length; i++) D_hidden1[i] = new Node(new decimal[128]);
-    for (int i = 0; i < D_hidden2.Length; i++) D_hidden2[i] = new Node(new decimal[11]);
-    for (int i = 0; i < D_output.Length; i++) D_output[i] = new Node();
-
-    // Load model weights
-    string modelPath = Path.Combine(Environment.CurrentDirectory, "model_weights.txt");
-    if (!File.Exists(modelPath))
-    {
-        Console.WriteLine("model_weights.txt not found. Please run 'train' first.");
-        return;
-    }
-
-    var lines = File.ReadAllLines(modelPath).Select(l => l.Trim()).Where(l => l.Length > 0).ToList();
-    string section = "";
-    int inpIndex = 0, h1Index = 0, h2Index = 0, outIndex = 0;
-    foreach (var line in lines)
-    {
-        if (line.StartsWith("#"))
-        {
-            if (line.Contains("D_input")) section = "D_input";
-            else if (line.Contains("D_hidden1")) section = "D_hidden1";
-            else if (line.Contains("D_hidden2")) section = "D_hidden2";
-            else if (line.Contains("D_output")) section = "D_output";
-            continue;
-        }
-
-        var parts = line.Split(',');
-        try
-        {
-            if (section == "D_input" && inpIndex < D_input.Length)
-            {
-                D_input[inpIndex].weights = parts.Select(p => decimal.Parse(p, CultureInfo.InvariantCulture)).ToArray();
-                inpIndex++;
-            }
-            else if (section == "D_hidden1" && h1Index < D_hidden1.Length)
-            {
-                D_hidden1[h1Index].weights = parts.Select(p => decimal.Parse(p, CultureInfo.InvariantCulture)).ToArray();
-                h1Index++;
-            }
-            else if (section == "D_hidden2" && h2Index < D_hidden2.Length)
-            {
-                D_hidden2[h2Index].weights = parts.Select(p => decimal.Parse(p, CultureInfo.InvariantCulture)).ToArray();
-                h2Index++;
-            }
-            else if (section == "D_output" && outIndex < D_output.Length)
-            {
-                D_output[outIndex].weights = parts.Select(p => decimal.Parse(p, CultureInfo.InvariantCulture)).ToArray();
-                outIndex++;
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Failed to parse weights line: {line}. Exception: {ex.Message}");
-        }
-    }
-
-    // Load testing images
-    DirectoryInfo di = new DirectoryInfo(System.Environment.CurrentDirectory + @"/mnist_png/testing");
-    List<ImageData> imageDatas = new List<ImageData>();
-    foreach (var subdir in di.GetDirectories())
-    {
-        foreach (var file in subdir.GetFiles())
-        {
-            imageDatas.Add(new ImageData(file.FullName, int.Parse(subdir.Name), int.Parse(file.Name.Split('.')[0].Split('a')[1])));
-        }
-    }
-
-    imageDatas.Sort(((a, b) => { if (a.FileName == b.FileName) return 0; else return (a.FileName < b.FileName) ? 1 : -1; }));
-    int maxTestSamples = ReadPositiveEnvInt("MAX_TEST_SAMPLES");
-    if (maxTestSamples > 0 && maxTestSamples < imageDatas.Count)
-    {
-        imageDatas = imageDatas.Take(maxTestSamples).ToList();
-        Console.WriteLine($"Test sample limit enabled: {imageDatas.Count}");
-    }
-
-    int correct = 0;
-    int total = imageDatas.Count;
-    for (int idxImg = 0; idxImg < imageDatas.Count; idxImg++)
-    {
-        var imageData = imageDatas[idxImg];
-        Bitmap bitmap = new Bitmap(imageData.ImagePath);
-        for (int i = 0; i < bitmap.Width; i++)
-        {
-            for (int j = 0; j < bitmap.Height; j++)
-            {
-                Color pixelColor = bitmap.GetPixel(i, j);
-                D_input[i * 28 + j].x = NormalizedPixelValue(pixelColor);
-            }
-        }
-
-        for (int h1 = 0; h1 < D_hidden1.Length; h1++)
-        {
-            D_hidden1[h1].Calculate(D_input, h1);
-        }
-
-        for (int h2 = 0; h2 < D_hidden2.Length; h2++)
-        {
-            D_hidden2[h2].CalculateReLU(D_hidden1, h2);
-        }
-
-        for (int o = 0; o < D_output.Length; o++)
-        {
-            D_output[o].Calculate(D_hidden2, o);
-            D_output[o].x = Sigmoid(D_output[o].x); // sigmoid으로 확률화
-        }
-
-        // prediction
-        int pred = 0;
-        decimal max = D_output[0].x;
-        for (int k = 1; k < 10; k++)
-        {
-            if (D_output[k].x > max) { max = D_output[k].x; pred = k; }
-        }
-        if (pred == imageData.Label) correct++;
-
-        Console.WriteLine($"{idxImg + 1}/{total} - label: {imageData.Label}, pred: {pred}");
-    }
-
-    Console.WriteLine($"Test complete. Accuracy: {(double)correct / total:P2} ({correct}/{total})");
 }
