@@ -6,6 +6,8 @@ namespace back_propagation
 {
     internal class Node
     {
+        private const double ActivationClamp = 1_000_000.0;
+
         public decimal[] weights { get; set; }
         public decimal x { get; set; }
 
@@ -21,22 +23,27 @@ namespace back_propagation
 
         public void Calculate(Node[] nodes, int mynum)
         {
-            decimal sum = 0;
+            double sum = 0.0;
             foreach (var node in nodes)
             {
-                sum += node.x * node.weights[mynum];
+                sum += Convert.ToDouble(node.x) * Convert.ToDouble(node.weights[mynum]);
             }
-            x = sum;
+
+            sum = Math.Clamp(sum, -ActivationClamp, ActivationClamp);
+            x = Convert.ToDecimal(sum);
         }
 
         public void CalculateReLU(Node[] nodes, int mynum)
         {
-            decimal sum = 0;
+            double sum = 0.0;
             foreach (var node in nodes)
             {
-                sum += (node.x > 0 ? node.x : 0) * node.weights[mynum];
+                double relu = Math.Max(Convert.ToDouble(node.x), 0.0);
+                sum += relu * Convert.ToDouble(node.weights[mynum]);
             }
-            x = sum;
+
+            sum = Math.Clamp(sum, -ActivationClamp, ActivationClamp);
+            x = Convert.ToDecimal(sum);
         }
     }
 }
